@@ -1,0 +1,48 @@
+.logo-container {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.heartbeat-icon {
+  font-size: 30px;
+  color: #22D3EE;
+  animation: heartbeat 1.2s infinite;
+}
+
+.logo-text {
+  font-size: 25px;
+  font-weight: 700;
+
+  background: linear-gradient(
+    90deg,
+    #7C5CFF,
+    #22D3EE
+  );
+
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+@keyframes heartbeat {
+  0% {
+    transform: scale(1);
+  }
+
+  25% {
+    transform: scale(1.2);
+  }
+
+  40% {
+    transform: scale(1);
+  }
+
+  60% {
+    transform: scale(1.2);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
