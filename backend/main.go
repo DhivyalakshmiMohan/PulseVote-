@@ -26,31 +26,47 @@ import (
 	"pulsevote/models"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return r.Header.Get("Origin") == "http://localhost:5173"
-	},
+// Check whether a browser origin is allowed.
+func isAllowedOrigin(origin string, allowedOrigins []string) bool {
+	for _, allowed := range allowedOrigins {
+		if origin == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
-	// Load environment variables
+
+	// Load local environment variables.
+	// Render will supply environment variables directly.
 	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env file not found")
+		log.Println("Using system environment variables")
 	}
 
+	// Get MongoDB connection string.
 	mongoURI := os.Getenv("MONGODB_URI")
+
 	if mongoURI == "" {
 		log.Fatal("MONGODB_URI is missing")
 	}
 
-	// Connect to MongoDB
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Connect to MongoDB.
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		15*time.Second,
+	)
 	defer cancel()
 
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	client, err := mongo.Connect(
+		ctx,
+		options.Client().ApplyURI(mongoURI),
+	)
+
 	if err != nil {
 		log.Fatal("MongoDB connection failed:", err)
 	}
+
 	defer client.Disconnect(context.Background())
 
 	if err := client.Ping(ctx, readpref.Primary()); err != nil {
@@ -61,28 +77,67 @@ func main() {
 
 	pollCollection := client.Database("pulsevote").Collection("polls")
 
-	// Connect to Redis
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: "127.0.0.1:6379",
-	})
+	// Connect to Redis using REDIS_URL.
+	redisURL := os.Getenv("REDIS_URL")
+
+	if redisURL == "" {
+		log.Fatal("REDIS_URL is missing")
+	}
+
+	redisOptions, err := redis.ParseURL(redisURL)
+
+	if err != nil {
+		log.Fatal("Invalid REDIS_URL:", err)
+	}
+
+	redisClient := redis.NewClient(redisOptions)
+	defer redisClient.Close()
 
 	if err := redisClient.Ping(context.Background()).Err(); err != nil {
 		log.Fatal("Redis connection failed:", err)
 	}
-	defer redisClient.Close()
 
 	log.Println("Redis connected successfully!")
 
+	// Configure frontend origins.
+	allowedOrigins := []string{
+		"http://localhost:5173",
+	}
+
+	frontendURL := strings.TrimRight(
+		os.Getenv("FRONTEND_URL"),
+		"/",
+	)
+
+	if frontendURL != "" {
+		allowedOrigins = append(allowedOrigins, frontendURL)
+	}
+
+	// Configure Gin.
 	router := gin.Default()
 
-	// CORS configuration for local React development
 	router.Use(cors.New(cors.Config{
-		AllowOrigins: []string{"http://localhost:5173"},
-		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders: []string{"Origin", "Content-Type", "Authorization"},
+		AllowOrigins: allowedOrigins,
+		AllowMethods: []string{
+			"GET", "POST", "PUT", "DELETE", "OPTIONS",
+		},
+		AllowHeaders: []string{
+			"Origin", "Content-Type", "Authorization",
+		},
+		AllowCredentials: true,
 	}))
 
-	// Health check
+	// WebSocket configuration.
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return isAllowedOrigin(
+				r.Header.Get("Origin"),
+				allowedOrigins,
+			)
+		},
+	}
+
+	// HEALTH CHECK
 	router.GET("/api/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "PulseVote backend is running!",
@@ -91,20 +146,25 @@ func main() {
 
 	// CREATE POLL
 	router.POST("/api/polls", func(c *gin.Context) {
+
 		var request struct {
 			Question string   `json:"question"`
 			Options  []string `json:"options"`
 		}
 
 		if err := c.ShouldBindJSON(&request); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid request",
+			})
 			return
 		}
 
 		question := strings.TrimSpace(request.Question)
 
 		if question == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Question is required"})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Question is required",
+			})
 			return
 		}
 
@@ -119,6 +179,7 @@ func main() {
 		seen := make(map[string]bool)
 
 		for _, option := range request.Options {
+
 			option = strings.TrimSpace(option)
 			key := strings.ToLower(option)
 
@@ -138,11 +199,14 @@ func main() {
 
 			seen[key] = true
 
-			pollOptions = append(pollOptions, models.PollOption{
-				ID:    uuid.NewString(),
-				Text:  option,
-				Votes: 0,
-			})
+			pollOptions = append(
+				pollOptions,
+				models.PollOption{
+					ID:    uuid.NewString(),
+					Text:  option,
+					Votes: 0,
+				},
+			)
 		}
 
 		poll := models.Poll{
@@ -152,7 +216,11 @@ func main() {
 			CreatedAt:  time.Now(),
 		}
 
-		result, err := pollCollection.InsertOne(c.Request.Context(), poll)
+		result, err := pollCollection.InsertOne(
+			c.Request.Context(),
+			poll,
+		)
+
 		if err != nil {
 			log.Println("Create poll error:", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -171,9 +239,15 @@ func main() {
 
 	// GET POLL
 	router.GET("/api/polls/:id", func(c *gin.Context) {
-		id, err := primitive.ObjectIDFromHex(c.Param("id"))
+
+		objectID, err := primitive.ObjectIDFromHex(
+			c.Param("id"),
+		)
+
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid poll ID"})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid poll ID",
+			})
 			return
 		}
 
@@ -181,11 +255,13 @@ func main() {
 
 		err = pollCollection.FindOne(
 			c.Request.Context(),
-			bson.M{"_id": id},
+			bson.M{"_id": objectID},
 		).Decode(&poll)
 
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Poll not found"})
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "Poll not found",
+			})
 			return
 		}
 
@@ -202,11 +278,15 @@ func main() {
 
 	// VOTE ON POLL
 	router.POST("/api/polls/:id/vote", func(c *gin.Context) {
+
 		idString := c.Param("id")
 
 		objectID, err := primitive.ObjectIDFromHex(idString)
+
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid poll ID"})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid poll ID",
+			})
 			return
 		}
 
@@ -216,7 +296,9 @@ func main() {
 		}
 
 		if err := c.ShouldBindJSON(&request); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid vote request"})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid vote request",
+			})
 			return
 		}
 
@@ -233,7 +315,9 @@ func main() {
 		filter := bson.M{
 			"_id":        objectID,
 			"options.id": request.OptionID,
-			"voters":     bson.M{"$ne": request.VoterID},
+			"voters": bson.M{
+				"$ne": request.VoterID,
+			},
 		}
 
 		update := bson.M{
@@ -261,6 +345,7 @@ func main() {
 		}
 
 		if result.MatchedCount == 0 {
+
 			var poll models.Poll
 
 			err := pollCollection.FindOne(
@@ -269,7 +354,9 @@ func main() {
 			).Decode(&poll)
 
 			if errors.Is(err, mongo.ErrNoDocuments) {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Poll not found"})
+				c.JSON(http.StatusNotFound, gin.H{
+					"error": "Poll not found",
+				})
 				return
 			}
 
@@ -281,6 +368,7 @@ func main() {
 			}
 
 			optionExists := false
+
 			for _, option := range poll.Options {
 				if option.ID == request.OptionID {
 					optionExists = true
@@ -301,7 +389,7 @@ func main() {
 			return
 		}
 
-		// Publish vote update to Redis
+		// Publish update to Redis.
 		err = redisClient.Publish(
 			c.Request.Context(),
 			"poll:"+idString,
@@ -317,27 +405,39 @@ func main() {
 		})
 	})
 
-	// WEBSOCKET: REAL-TIME POLL UPDATES
+	// WEBSOCKET: LIVE POLL UPDATES
 	router.GET("/ws/polls/:id", func(c *gin.Context) {
+
 		pollID := c.Param("id")
 
 		objectID, err := primitive.ObjectIDFromHex(pollID)
+
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid poll ID"})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid poll ID",
+			})
 			return
 		}
 
-		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		conn, err := upgrader.Upgrade(
+			c.Writer,
+			c.Request,
+			nil,
+		)
+
 		if err != nil {
 			log.Println("WebSocket upgrade error:", err)
 			return
 		}
+
 		defer conn.Close()
 
+		// Subscribe to this poll's Redis channel.
 		pubsub := redisClient.Subscribe(
 			context.Background(),
 			"poll:"+pollID,
 		)
+
 		defer pubsub.Close()
 
 		if _, err := pubsub.Receive(context.Background()); err != nil {
@@ -345,7 +445,9 @@ func main() {
 			return
 		}
 
+		// Send current poll data.
 		sendPoll := func() error {
+
 			var poll models.Poll
 
 			err := pollCollection.FindOne(
@@ -365,7 +467,9 @@ func main() {
 			return
 		}
 
+		// Send updated poll whenever Redis publishes a vote.
 		for range pubsub.Channel() {
+
 			if err := sendPoll(); err != nil {
 				log.Println("WebSocket send error:", err)
 				return
@@ -373,6 +477,15 @@ func main() {
 		}
 	})
 
-	log.Println("PulseVote server starting on port 8080")
-	log.Fatal(router.Run(":8080"))
+	// PORT CONFIGURATION FOR RENDER
+	port := os.Getenv("PORT")
+
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Println("PulseVote backend starting on port", port)
+
+	// Listen on the port provided by Render or local development.
+	log.Fatal(router.Run(":" + port))
 }
