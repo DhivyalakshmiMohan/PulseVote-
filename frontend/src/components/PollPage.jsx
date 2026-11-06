@@ -1,6 +1,7 @@
 
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
+import { API_URL, WS_URL } from '../config'
 import './PollPage.css'
 
 function PollPage() {
@@ -9,141 +10,142 @@ function PollPage() {
   const [poll, setPoll] = useState(null)
   const [selectedOption, setSelectedOption] = useState('')
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
   const [voting, setVoting] = useState(false)
-  const [liveConnected, setLiveConnected] = useState(false)
+  const [error, setError] = useState('')
+  const [connectionStatus, setConnectionStatus] = useState('CONNECTING...')
 
-  // Temporary voter ID for development only.
-  const [voterId] = useState(() => {
-    let savedId = localStorage.getItem('pulsevote_voter_id')
-
-    if (!savedId) {
-      savedId = crypto.randomUUID()
-      localStorage.setItem('pulsevote_voter_id', savedId)
-    }
-
-    return savedId
-  })
-
-  // Fetch initial poll and establish WebSocket connection.
   useEffect(() => {
-    let active = true
+    let socket
+    let reconnectTimer
+    let isActive = true
 
     async function fetchPoll() {
       try {
-        setLoading(true)
-        setError('')
+        const response = await fetch(`${API_URL}/api/polls/${id}`)
 
-        const response = await fetch(
-          `http://localhost:8080/api/polls/${id}`
-        )
+        if (!response.ok) {
+          throw new Error('Could not load this poll.')
+        }
 
         const data = await response.json()
 
-        if (!response.ok) {
-          throw new Error(data.error || 'Could not load poll')
-        }
-
-        if (active) {
+        if (isActive) {
           setPoll(data)
+          setError('')
         }
       } catch (err) {
-        if (active) {
+        if (isActive) {
           setError(err.message)
         }
       } finally {
-        if (active) {
+        if (isActive) {
           setLoading(false)
         }
       }
     }
 
-    fetchPoll()
+    function connectWebSocket() {
+      if (!isActive) return
 
-    // Connect to the Go WebSocket endpoint.
-    const socket = new WebSocket(
-      `ws://localhost:8080/ws/polls/${id}`
-    )
+      socket = new WebSocket(`${WS_URL}/ws/polls/${id}`)
 
-    socket.onopen = () => {
-      if (active) {
-        setLiveConnected(true)
-        console.log('Live poll connection established')
-      }
-    }
-
-    // Receive updated poll data from the backend.
-    socket.onmessage = (event) => {
-      try {
-        const updatedPoll = JSON.parse(event.data)
-
-        if (active) {
-          setPoll(updatedPoll)
+      socket.onopen = () => {
+        if (isActive) {
+          setConnectionStatus('LIVE CONNECTED')
         }
+      }
 
-        console.log('Live poll results updated!')
-      } catch (err) {
-        console.error('Could not read live poll update:', err)
+      socket.onmessage = event => {
+        try {
+          const updatedPoll = JSON.parse(event.data)
+
+          if (isActive) {
+            setPoll(updatedPoll)
+            setError('')
+          }
+        } catch {
+          console.error('Received invalid poll update.')
+        }
+      }
+
+      socket.onerror = () => {
+        if (isActive) {
+          setConnectionStatus('CONNECTION ERROR')
+        }
+      }
+
+      socket.onclose = () => {
+        if (!isActive) return
+
+        setConnectionStatus('RECONNECTING...')
+
+        reconnectTimer = setTimeout(() => {
+          connectWebSocket()
+        }, 3000)
       }
     }
 
-    socket.onerror = (err) => {
-      console.error('WebSocket connection error:', err)
-    }
+    fetchPoll()
+    connectWebSocket()
 
-    socket.onclose = () => {
-      if (active) {
-        setLiveConnected(false)
-      }
-    }
-
-    // Clean up when leaving the poll page.
     return () => {
-      active = false
-      socket.close()
+      isActive = false
+      clearTimeout(reconnectTimer)
+
+      if (socket) {
+        socket.close()
+      }
     }
   }, [id])
 
-  // Submit vote.
   async function handleVote() {
     if (!selectedOption) {
-      setMessage('Please select an option first.')
+      setError('Please select an option before voting.')
       return
     }
 
-    try {
-      setVoting(true)
-      setMessage('')
+    setVoting(true)
+    setError('')
 
-      const response = await fetch(
-        `http://localhost:8080/api/polls/${id}/vote`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            optionId: selectedOption,
-            voterId: voterId
-          })
-        }
-      )
+    try {
+      let voterId = localStorage.getItem('pulsevote_voter_id')
+
+      if (!voterId) {
+        voterId = crypto.randomUUID()
+        localStorage.setItem('pulsevote_voter_id', voterId)
+      }
+
+      const response = await fetch(`${API_URL}/api/polls/${id}/vote`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          optionId: selectedOption,
+          voterId,
+        }),
+      })
 
       const data = await response.json()
 
       if (!response.ok) {
-        throw new Error(data.error || 'Could not submit vote')
+        throw new Error(data.message || 'Voting failed.')
       }
 
-      setMessage('Your vote was recorded successfully!')
+      if (data.poll) {
+        setPoll(data.poll)
+      } else {
+        const updatedResponse = await fetch(`${API_URL}/api/polls/${id}`)
+
+        if (updatedResponse.ok) {
+          const updatedPoll = await updatedResponse.json()
+          setPoll(updatedPoll)
+        }
+      }
+
       setSelectedOption('')
-
-      // No manual refresh is needed.
-      // Redis + WebSocket will send the updated poll.
-
     } catch (err) {
-      setMessage(err.message)
+      setError(err.message || 'Something went wrong.')
     } finally {
       setVoting(false)
     }
@@ -153,39 +155,39 @@ function PollPage() {
     return <div className="poll-page">Loading poll...</div>
   }
 
-  if (error) {
-    return <div className="poll-page error">{error}</div>
-  }
-
   if (!poll) {
-    return <div className="poll-page">Poll not found.</div>
+    return (
+      <div className="poll-page">
+        <p>{error || 'Poll not found.'}</p>
+      </div>
+    )
   }
 
   const totalVotes = poll.totalVotes || 0
 
   return (
-    <div className="poll-page">
+    <main className="poll-page">
       <div className="poll-card">
-
-        <span className="live-badge">
-          ● {liveConnected ? 'LIVE CONNECTED' : 'CONNECTING...'}
-        </span>
+        <div className="poll-status">
+          <span>{connectionStatus}</span>
+        </div>
 
         <h1>{poll.question}</h1>
 
-        <p className="vote-count">
-          {totalVotes} total votes
+        <p className="total-votes">
+          {totalVotes} {totalVotes === 1 ? 'vote' : 'votes'}
         </p>
 
         <div className="poll-options">
-          {poll.options.map((option) => {
-            const percentage = totalVotes === 0
-              ? 0
-              : (option.votes / totalVotes) * 100
+          {poll.options.map(option => {
+            const percentage =
+              totalVotes > 0
+                ? Math.round((option.votes / totalVotes) * 100)
+                : 0
 
             return (
               <label
-                className={`poll-choice ${
+                className={`poll-option ${
                   selectedOption === option.id ? 'selected' : ''
                 }`}
                 key={option.id}
@@ -198,10 +200,10 @@ function PollPage() {
                   onChange={() => setSelectedOption(option.id)}
                 />
 
-                <div className="choice-content">
-                  <div className="choice-info">
+                <div className="poll-option-content">
+                  <div className="poll-option-info">
                     <span>{option.text}</span>
-                    <span>{percentage.toFixed(1)}%</span>
+                    <strong>{percentage}%</strong>
                   </div>
 
                   <div className="progress-track">
@@ -211,7 +213,9 @@ function PollPage() {
                     />
                   </div>
 
-                  <small>{option.votes} votes</small>
+                  <small>
+                    {option.votes} {option.votes === 1 ? 'vote' : 'votes'}
+                  </small>
                 </div>
               </label>
             )
@@ -221,17 +225,14 @@ function PollPage() {
         <button
           className="vote-button"
           onClick={handleVote}
-          disabled={voting || !selectedOption}
+          disabled={!selectedOption || voting}
         >
-          {voting ? 'Submitting...' : 'Submit Vote'}
+          {voting ? 'Submitting...' : 'Submit vote'}
         </button>
 
-        {message && (
-          <p className="vote-message">{message}</p>
-        )}
-
+        {error && <p className="error-message">{error}</p>}
       </div>
-    </div>
+    </main>
   )
 }
 
